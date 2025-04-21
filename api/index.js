@@ -101,65 +101,70 @@ app.get("/getdates/:coordinates", async (req, res) => {
       .ImageCollection("COPERNICUS/S2")
       .filterDate("2015-01-01", "2099-05-01")
       .filterBounds(geometry)
-      .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", 15);
+      .filterMetadata("CLOUDY_PIXEL_PERCENTAGE", "less_than", 15)
+      .map((img) => {
+        const ndvi = img.normalizedDifference(["B8", "B4"]).rename("nd");
 
-    const imageCollectionMap = imageCollection.map((image) => {
-      image = image.addBands(image.normalizedDifference(["B8", "B4"]));
+        // Check if QA60 exists; if not, skip masking
+        const bandNames = img.bandNames();
+        const hasQA60 = bandNames.contains("QA60");
 
-      const QA = image.select("QA60");
-      const clouds = QA.bitwiseAnd(1 << 10).eq(0);
-      const cirrus = QA.bitwiseAnd(1 << 11).eq(0);
+        const maskedImg = ee.Algorithms.If(
+          hasQA60,
+          (() => {
+            const QA = img.select("QA60");
+            const clouds = QA.bitwiseAnd(1 << 10).eq(0);
+            const cirrus = QA.bitwiseAnd(1 << 11).eq(0);
+            return img.updateMask(clouds).updateMask(cirrus);
+          })(),
+          img
+        );
 
-      return image.updateMask(clouds).updateMask(cirrus);
-    });
+        const imgWithNDVI = ee.Image(maskedImg).addBands(ndvi);
 
-    const imageCollectionList = imageCollectionMap.toList(imageCollectionMap.size());
-
-    const dates = imageCollectionList.map((item) =>
-      ee.Date(ee.Image(item).get("system:time_start")).format("YYYY-MM-dd")
-    );
-
-    let ndvis = imageCollectionList.map((item) => {
-      const image = ee.Image(item);
-      const value = image.reduceRegion(ee.Reducer.mean(), geometry, 10);
-      return value.get("nd");
-    });
-
-    const combined = ee.List.sequence(0, ndvis.size().subtract(2)).map((i) => {
-      const iNum = ee.Number(i);
-      const today = ee.Number(ndvis.get(iNum));
-      const tomorrow = ee.Number(ndvis.get(iNum.add(1)));
-
-      const dateFrom = dates.get(iNum);
-      const dateTo = dates.get(iNum.add(1));
-
-      const difference = tomorrow.subtract(today);
-
-      return ee.Dictionary({
-        index: iNum,
-        dateFrom,
-        dateTo,
-        difference,
+        return imgWithNDVI
+          .set("system:time_start", img.get("system:time_start"))
+          .set("nd_mean", ndvi.reduceRegion(ee.Reducer.mean(), geometry, 10).get("nd"));
       });
+
+    const sorted = imageCollection.sort("system:time_start");
+    const list = sorted.toList(sorted.size());
+
+    const maxDifference = ee.Number(0.2);
+
+    const differences = ee.List.sequence(0, list.size().subtract(2)).map((i) => {
+      const i0 = ee.Number(i);
+      const i1 = i0.add(1);
+
+      const imgA = ee.Image(list.get(i0));
+      const imgB = ee.Image(list.get(i1));
+
+      const ndA = ee.Number(imgA.get("nd_mean"));
+      const ndB = ee.Number(imgB.get("nd_mean"));
+      const diff = ndB.subtract(ndA);
+
+      return ee.Algorithms.If(
+        diff.gt(maxDifference),
+        {
+          dateFrom: ee.Date(imgA.get("system:time_start")).format("YYYY-MM-dd"),
+          dateTo: ee.Date(imgB.get("system:time_start")).format("YYYY-MM-dd"),
+          difference: diff,
+        },
+        null
+      );
     });
 
-    const filtered = combined.map((obj) => {
-      const dict = ee.Dictionary(obj);
-      return ee.Algorithms.If(ee.Number(dict.get("difference")).gt(0.2), dict, null);
+    const filtered = ee.List(differences).removeAll([null]);
+
+    filtered.evaluate((result, error) => {
+      if (error) {
+        console.error("[/getdates] Evaluation error:", error);
+        return res.status(500).json({ error: "Earth Engine evaluation failed" });
+      }
+
+      console.debug("[/getdates] Returning", result.length, "items");
+      res.json(result.reverse());
     });
-
-    ee.List(filtered)
-      .removeAll([null])
-      .evaluate((result, error) => {
-        if (error) {
-          console.error("[/getdates] Evaluation error:", error);
-          return res.status(500).json({ error: "Failed to evaluate NDVI differences" });
-        }
-
-        const reversed = result.reverse();
-        console.debug("[/getdates] Filtered results count:", reversed.length);
-        res.json(reversed);
-      });
   } catch (err) {
     console.error("[/getdates] Processing error:", err);
     res.status(500).json({ error: "Failed to process image collection" });
