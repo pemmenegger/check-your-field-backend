@@ -65,13 +65,12 @@ app.get("/calculatearea/:coordinates", async (req, res) => {
   try {
     const geometry = ee.Geometry.Polygon(parsedCoords);
 
-    // Wrap getInfo in a Promise with timeout
     const getArea = () =>
       new Promise((resolve, reject) => {
         geometry
           .area()
           .divide(1000 * 10)
-          .getInfo((result, error) => {
+          .evaluate((result, error) => {
             if (error) return reject(error);
             resolve(result);
           });
@@ -116,41 +115,51 @@ app.get("/getdates/:coordinates", async (req, res) => {
 
     const imageCollectionList = imageCollectionMap.toList(imageCollectionMap.size());
 
-    const dates = imageCollectionList.map((item) => ee.Date(ee.Image(item).get("system:time_start")));
+    const dates = imageCollectionList.map((item) =>
+      ee.Date(ee.Image(item).get("system:time_start")).format("YYYY-MM-dd")
+    );
 
     let ndvis = imageCollectionList.map((item) => {
       const image = ee.Image(item);
-      const value = image.reduceRegion(ee.Reducer.mean(), geometry, 1);
+      const value = image.reduceRegion(ee.Reducer.mean(), geometry, 10);
       return value.get("nd");
     });
 
-    ndvis = ndvis.filter(ee.Filter.eq("item", null).not());
+    const combined = ee.List.sequence(0, ndvis.size().subtract(2)).map((i) => {
+      const iNum = ee.Number(i);
+      const today = ee.Number(ndvis.get(iNum));
+      const tomorrow = ee.Number(ndvis.get(iNum.add(1)));
 
-    const ndList = ee.List.sequence(0, ee.Number(ndvis.size()).subtract(2));
-    const differenceObjects = ndList.map((i) => {
-      const today = ee.Number(ndvis.get(i));
-      const tomorrow = ee.Number(ndvis.get(ee.Number(i).add(1)));
+      const dateFrom = dates.get(iNum);
+      const dateTo = dates.get(iNum.add(1));
+
+      const difference = tomorrow.subtract(today);
 
       return ee.Dictionary({
-        index: i,
-        dateFrom: dates.get(i),
-        dateTo: dates.get(ee.Number(i).add(1)),
-        difference: tomorrow.subtract(today),
+        index: iNum,
+        dateFrom,
+        dateTo,
+        difference,
       });
     });
 
-    const maxDifference = ee.Number(0.2);
-    const differenceRestriction = differenceObjects.map((obj) => {
+    const filtered = combined.map((obj) => {
       const dict = ee.Dictionary(obj);
-      const diff = ee.Number(dict.get("difference"));
-      return ee.Algorithms.If(diff.gt(maxDifference), dict, null);
+      return ee.Algorithms.If(ee.Number(dict.get("difference")).gt(0.2), dict, null);
     });
 
-    let filteredCollection = differenceRestriction.filter(ee.Filter.eq("item", null).not());
+    ee.List(filtered)
+      .removeAll([null])
+      .evaluate((result, error) => {
+        if (error) {
+          console.error("[/getdates] Evaluation error:", error);
+          return res.status(500).json({ error: "Failed to evaluate NDVI differences" });
+        }
 
-    filteredCollection = filteredCollection.getInfo().reverse();
-    console.debug("[/getdates] Filtered results count:", filteredCollection.length);
-    res.json(filteredCollection);
+        const reversed = result.reverse();
+        console.debug("[/getdates] Filtered results count:", reversed.length);
+        res.json(reversed);
+      });
   } catch (err) {
     console.error("[/getdates] Processing error:", err);
     res.status(500).json({ error: "Failed to process image collection" });
